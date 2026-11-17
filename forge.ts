@@ -79,6 +79,20 @@ export interface RepoRec {
   /** Issues and pull requests share one number sequence, as on GitHub. */
   nextNumber: number;
   createdTick: number;
+  /**
+   * Serialized REST bodies of open issues, keyed by `login|repo-name|number`: an open
+   * issue's every field is fixed except its comment count and its labels, both of which
+   * invalidate the entry (see invalidateIssueBody), so the read workload's 2,000 GETs
+   * of one issue answer from the cache instead of rebuilding the JSON each time.
+   */
+  issueBodyCache: Map<string, Buffer>;
+  /**
+   * Whole fetch answers (upload-pack v0/v2 bodies), keyed by the fetch's inputs: a
+   * fetch's content depends only on immutable objects, so an identical fetch of the
+   * same repository answers from the cache. Entries are stored only for complete
+   * selections (see fetchSelection); the map is dropped with the repository.
+   */
+  fetchCache: Map<string, Buffer>;
 }
 
 /** Flattened tree view: full path -> blob entry. */
@@ -137,6 +151,31 @@ export class Forge {
     return this.viewerLogin ?? 'viewer';
   }
 
+  /** The issue-body cache key: the login and repository name are part of the bytes. */
+  private issueBodyKey(repo: RepoRec, number: number): string {
+    return `${this.login()}|${repo.name}|${number}`;
+  }
+
+  /** A cached serialized body for an open issue, or undefined (closed issues are never cached: their closed_at reads the clock). */
+  cachedIssueBody(repo: RepoRec, issue: IssueRec): Buffer | undefined {
+    if (issue.state !== 'open') return undefined;
+    return repo.issueBodyCache.get(this.issueBodyKey(repo, issue.number));
+  }
+
+  /** Store a serialized body for an open issue. */
+  cacheIssueBody(repo: RepoRec, issue: IssueRec, body: Buffer): void {
+    if (issue.state !== 'open') return;
+    repo.issueBodyCache.set(this.issueBodyKey(repo, issue.number), body);
+  }
+
+  /** Drop every cached body of one issue (patch, comment, close). */
+  invalidateIssueBody(repo: RepoRec, number: number): void {
+    const suffix = `|${number}`;
+    for (const key of [...repo.issueBodyCache.keys()]) {
+      if (key.endsWith(suffix)) repo.issueBodyCache.delete(key);
+    }
+  }
+
   // ----------------------------------------------------------------------------------------------
   // Repositories.
   // ----------------------------------------------------------------------------------------------
@@ -157,6 +196,8 @@ export class Forge {
       pulls: new Map(),
       nextNumber: 1,
       createdTick: this.advance(),
+      issueBodyCache: new Map(),
+      fetchCache: new Map(),
     };
     this.nextDbId += 1;
     this.repos.set(name, repo);
@@ -633,6 +674,9 @@ export class Forge {
    * not already hold (the closure of `haves`, truncated at the client's declared shallow
    * boundary), cut to `depth` commit generations from the wants when a depth is given.
    * Also answers the new shallow boundary and the boundary commits the fetch unshallows.
+   * `complete` is false when the send set should have held an object the repository does
+   * not have (an incomplete pack's gap): the answer is still the best the store can give,
+   * but it must not be cached, because the missing object may arrive later.
    */
   fetchSelection(
     repo: RepoRec,
@@ -640,7 +684,8 @@ export class Forge {
     haves: readonly string[],
     shallowDeclared: readonly string[],
     depth: number | null,
-  ): { objects: GitObj[]; shallow: string[]; unshallow: string[] } {
+  ): { objects: GitObj[]; shallow: string[]; unshallow: string[]; complete: boolean } {
+    let complete = true;
     const boundary = new Set(shallowDeclared);
     const held = this.closure(repo, haves, boundary);
 
@@ -680,7 +725,10 @@ export class Forge {
     const stack: string[] = [];
     for (const oid of includedCommits) {
       const commit = this.commitInfo(repo, oid);
-      if (commit === null) continue;
+      if (commit === null) {
+        complete = false;
+        continue;
+      }
       send.add(oid);
       stack.push(commit.tree);
     }
@@ -692,7 +740,10 @@ export class Forge {
       const oid = stack.pop();
       if (oid === undefined || send.has(oid) || held.has(oid)) continue;
       const object = repo.objects.get(oid);
-      if (object === undefined) continue;
+      if (object === undefined) {
+        complete = false;
+        continue;
+      }
       send.add(oid);
       if (object.type === 'tree') for (const entry of parseTree(object.data)) stack.push(entry.oid);
       else if (object.type === 'tag') stack.push(parseTag(object.data).object);
@@ -726,6 +777,6 @@ export class Forge {
     // Commits first, then trees, then blobs and tags: a stable, readable pack order.
     const rank = (object: GitObj): number => (object.type === 'commit' ? 0 : object.type === 'tree' ? 1 : 2);
     objects.sort((a, b) => rank(a) - rank(b));
-    return { objects, shallow, unshallow };
+    return { objects, shallow, unshallow, complete };
   }
 }

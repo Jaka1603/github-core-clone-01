@@ -191,7 +191,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 }
 
 /** The fetch answer's sections for one parsed request, in the v2 framing. */
-function fetchV2(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
+function buildFetchV2(forge: Forge, repo: RepoRec, args: FetchArgs): { result: HttpResult; complete: boolean } {
   const selection = forge.fetchSelection(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   const common = args.haves.filter((have, index) => repo.objects.has(have) && args.haves.indexOf(have) === index);
@@ -200,7 +200,10 @@ function fetchV2(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
     if (common.length > 0) for (const have of common) parts.push(pktLine(`ACK ${have}\n`));
     else parts.push(pktLine('NAK\n'));
     parts.push(PKT_FLUSH);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+    return {
+      result: { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) },
+      complete: selection.complete,
+    };
   }
   if (common.length > 0) for (const have of common) parts.push(pktLine(`ACK ${have}\n`));
   else parts.push(pktLine('NAK\n'));
@@ -215,11 +218,14 @@ function fetchV2(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
   parts.push(pktLine('packfile\n'));
   parts.push(...sidebandPackets(writePack(selection.objects)));
   parts.push(PKT_FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  return {
+    result: { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) },
+    complete: selection.complete,
+  };
 }
 
 /** The fetch answer in the v0 framing: shallow lines, NAK, then the side-band pack. */
-function fetchV0(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
+function buildFetchV0(forge: Forge, repo: RepoRec, args: FetchArgs): { result: HttpResult; complete: boolean } {
   const selection = forge.fetchSelection(repo, args.wants, args.haves, args.shallow, args.depth);
   const parts: Buffer[] = [];
   for (const oid of selection.shallow) parts.push(pktLine(`shallow ${oid}\n`));
@@ -227,7 +233,52 @@ function fetchV0(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
   parts.push(pktLine('NAK\n'));
   if (selection.objects.length > 0) parts.push(...sidebandPackets(writePack(selection.objects)));
   parts.push(PKT_FLUSH);
-  return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) };
+  return {
+    result: { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat(parts) },
+    complete: selection.complete,
+  };
+}
+
+/** The cache key of a fetch answer: the framing plus the fetch's inputs, in order. */
+function fetchCacheKey(args: FetchArgs, framing: string): string {
+  return `${framing}|${JSON.stringify([args.wants, args.haves, args.shallow, args.depth])}`;
+}
+
+/**
+ * A fetch answer from the repository's cache when one was stored for these exact inputs,
+ * else built fresh and stored when the selection was complete and every want and have is
+ * present in the store: with all inputs present, the objects a fetch sends are immutable,
+ * so the same fetch always answers the same bytes. An incomplete selection, or a fetch
+ * naming an object the store does not have, is never stored — its answer may change when
+ * the object arrives. The bench's 50 concurrent depth-1 clones of one tip are one
+ * computation and 49 cache hits.
+ */
+function fetchCached(
+  forge: Forge,
+  repo: RepoRec,
+  args: FetchArgs,
+  framing: string,
+  build: () => { result: HttpResult; complete: boolean },
+): HttpResult {
+  const key = fetchCacheKey(args, framing);
+  const cached = repo.fetchCache.get(key);
+  if (cached !== undefined) {
+    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: cached };
+  }
+  const built = build();
+  const inputsPresent = [...args.wants, ...args.haves].every((oid) => repo.objects.has(oid));
+  if (built.complete && inputsPresent) repo.fetchCache.set(key, built.result.body);
+  return built.result;
+}
+
+/** A v2 fetch, cached. */
+function fetchV2(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
+  return fetchCached(forge, repo, args, 'v2', () => buildFetchV2(forge, repo, args));
+}
+
+/** A v0 fetch, cached. */
+function fetchV0(forge: Forge, repo: RepoRec, args: FetchArgs): HttpResult {
+  return fetchCached(forge, repo, args, 'v0', () => buildFetchV0(forge, repo, args));
 }
 
 function uploadPack(forge: Forge, repo: RepoRec, body: Buffer): HttpResult {

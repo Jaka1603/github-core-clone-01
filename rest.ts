@@ -113,6 +113,8 @@ export function repoJson(forge: Forge, repo: RepoRec): Record<string, unknown> {
 }
 
 export function issueJson(forge: Forge, repo: RepoRec, issue: IssueRec): Record<string, unknown> {
+  const login = forge.login();
+  const createdAt = forge.isoOf(issue.createdTick);
   return {
     id: issue.id,
     node_id: Buffer.from(`I${repo.dbId}.${issue.number}`, 'utf8').toString('base64url'),
@@ -124,13 +126,13 @@ export function issueJson(forge: Forge, repo: RepoRec, issue: IssueRec): Record<
       const label = repo.labels.get(name);
       return { name, color: label?.color ?? 'ededed', default: false, description: null };
     }),
-    user: { login: forge.login(), id: 1000, type: 'User' },
+    user: { login, id: 1000, type: 'User' },
     comments: issue.comments.length,
-    created_at: forge.isoOf(issue.createdTick),
-    updated_at: forge.isoOf(issue.createdTick),
+    created_at: createdAt,
+    updated_at: createdAt,
     closed_at: issue.state === 'closed' ? forge.nowIso() : null,
-    html_url: `https://forge.local/${forge.login()}/${repo.name}/issues/${issue.number}`,
-    url: `/api/v3/repos/${forge.login()}/${repo.name}/issues/${issue.number}`,
+    html_url: `https://forge.local/${login}/${repo.name}/issues/${issue.number}`,
+    url: `/api/v3/repos/${login}/${repo.name}/issues/${issue.number}`,
   };
 }
 
@@ -419,7 +421,13 @@ function listIssues(req: RestRequest, repo: RepoRec): HttpResult {
 function getIssue(req: RestRequest, repo: RepoRec, number: number): HttpResult {
   const issue = repo.issues.get(number);
   if (issue === undefined) return notFound();
-  return json(200, issueJson(req.forge, repo, issue));
+  // An open issue's serialized body never changes except on a patch or a comment, both
+  // of which invalidate the entry: the read workload's repeated GETs answer from here.
+  const cached = req.forge.cachedIssueBody(repo, issue);
+  if (cached !== undefined) return { status: 200, contentType: JSON_TYPE, body: cached };
+  const result = json(200, issueJson(req.forge, repo, issue));
+  req.forge.cacheIssueBody(repo, issue, result.body);
+  return result;
 }
 
 function patchIssue(req: RestRequest, repo: RepoRec, number: number): HttpResult {
@@ -435,6 +443,7 @@ function patchIssue(req: RestRequest, repo: RepoRec, number: number): HttpResult
     if (labels === null) return validation('one of the labels does not exist on this repository');
     issue.labels = labels;
   }
+  req.forge.invalidateIssueBody(repo, number);
   return json(200, issueJson(req.forge, repo, issue));
 }
 
@@ -444,6 +453,7 @@ function createComment(req: RestRequest, repo: RepoRec, number: number): HttpRes
   const parsed = parseBody(req.bodyText);
   if (!parsed.ok) return parsed.result;
   const comment = req.forge.addComment(repo, issue, str(parsed.value.body));
+  req.forge.invalidateIssueBody(repo, number);
   return json(201, commentJson(req.forge, comment));
 }
 

@@ -231,12 +231,33 @@ function encodePackObjectHeader(typeCode: number, size: number): Buffer {
 }
 
 /**
- * Inflate one zlib stream starting at `offset`, finding its exact end. zlib's sync inflate
- * ignores trailing bytes and throws on a truncated stream, so the consumed length is the
- * shortest prefix that inflates — probed exponentially, then bisected.
+ * Inflate one zlib stream starting at `offset`, finding its exact end. The fast path
+ * inflates the tail in a single call: inflateSync ignores bytes past the stream's end,
+ * and with `{ info: true }` the engine reports exactly how many input bytes the stream
+ * consumed (`bytesWritten`), so one call replaces the old exponential probe plus
+ * bisection (about eleven inflate calls, most of them throwing on truncated input).
+ * When the engine's count is not plausible, the old probing path runs instead.
  */
 function inflateExact(buffer: Buffer, offset: number): { data: Buffer; next: number } {
   const remaining = buffer.length - offset;
+  try {
+    const out = inflateSync(buffer.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten?: unknown };
+    };
+    const consumed = out.engine?.bytesWritten;
+    if (
+      typeof consumed === 'number' &&
+      Number.isInteger(consumed) &&
+      consumed > 0 &&
+      consumed <= remaining
+    ) {
+      return { data: out.buffer, next: offset + consumed };
+    }
+  } catch {
+    // A truncated or corrupt stream: fall through to the probing path, which
+    // raises the same failure the old code raised.
+  }
   const attempt = (length: number): Buffer | null => {
     try {
       return inflateSync(buffer.subarray(offset, offset + length));
@@ -352,11 +373,15 @@ export function readPack(
     let byte = buffer[offset] ?? 0;
     offset += 1;
     const typeCode = (byte >> 4) & 0x07;
-    // The declared size is not needed to read the stream (inflate finds its own end), but it
-    // must be consumed from the header bytes.
+    // The header's declared size: the low nibble first, then 7 bits a byte,
+    // little-endian. The inflate below must produce exactly this many bytes.
+    let declaredSize = byte & 0x0f;
+    let sizeShift = 4;
     while (byte & 0x80) {
       byte = buffer[offset] ?? 0;
       offset += 1;
+      declaredSize += (byte & 0x7f) * 2 ** sizeShift;
+      sizeShift += 7;
     }
     if (typeCode === 6) {
       // OFS_DELTA: a negative offset to the base entry, in git's offset encoding.
@@ -370,18 +395,21 @@ export function readPack(
       }
       const inflated = inflateExact(buffer, offset);
       offset = inflated.next;
+      if (inflated.data.length !== declaredSize) throw new Error('pack object size mismatch');
       pending.push({ entryOffset, kind: 'ofs', baseOffset: entryOffset - baseOffset, delta: inflated.data });
     } else if (typeCode === 7) {
       const baseOid = buffer.toString('hex', offset, offset + 20);
       offset += 20;
       const inflated = inflateExact(buffer, offset);
       offset = inflated.next;
+      if (inflated.data.length !== declaredSize) throw new Error('pack object size mismatch');
       pending.push({ entryOffset, kind: 'ref', baseOid, delta: inflated.data });
     } else {
       const type = CODE_TO_TYPE[typeCode];
       if (type === undefined) throw new Error(`unknown pack object type ${typeCode}`);
       const inflated = inflateExact(buffer, offset);
       offset = inflated.next;
+      if (inflated.data.length !== declaredSize) throw new Error('pack object size mismatch');
       rawByOffset.set(entryOffset, { type, data: inflated.data, entryOffset });
     }
   }

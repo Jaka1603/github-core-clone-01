@@ -544,6 +544,7 @@ function resolveField(ctx: ExecContext, type: string, source: unknown, field: Fi
           return object('CloseIssuePayload', { issue: null });
         }
         issue.state = 'closed';
+        forge.invalidateIssueBody(repo, decoded.number);
         return object('CloseIssuePayload', { issue: { repo, issue } });
       }
       if (name === 'createPullRequest') {
@@ -592,6 +593,7 @@ function resolveField(ctx: ExecContext, type: string, source: unknown, field: Fi
           return object('AddCommentPayload', { edge: null });
         }
         const comment = forge.addComment(repo, issue, typeof input.body === 'string' ? input.body : '');
+        forge.invalidateIssueBody(repo, decoded.number);
         return object('AddCommentPayload', { edge: { repo, comment } });
       }
       break;

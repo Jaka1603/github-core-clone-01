@@ -177,6 +177,7 @@ function runTool(forge: Forge, name: string, args: Record<string, unknown>): Too
       const issue = repo.issues.get(number);
       if (issue === undefined) return { ok: false, message: 'issue not found' };
       const comment = forge.addComment(repo, issue, typeof args.body === 'string' ? args.body : '');
+      forge.invalidateIssueBody(repo, number);
       return { ok: true, value: { id: comment.id, body: comment.body } };
     }
     default:

@@ -56,6 +56,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 /** Percent-decode one path segment, tolerating bad escapes. */
 function decodeSegment(segment: string): string {
+  if (!segment.includes('%')) return segment;
   try {
     return decodeURIComponent(segment);
   } catch {
@@ -66,8 +67,13 @@ function decodeSegment(segment: string): string {
 const GIT_PATH = /^\/([^/]+)\/(.+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
 async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
-  const url = new URL(req.url ?? '/', 'http://entry');
-  const path = url.pathname;
+  // Split the raw target by hand: a full WHATWG URL parse per request costs more than
+  // the routing that follows it, and the path stays percent-encoded here exactly as the
+  // URL parser left it (segments are decoded one by one below).
+  const rawUrl = req.url ?? '/';
+  const queryIndex = rawUrl.indexOf('?');
+  const path = queryIndex < 0 ? rawUrl : rawUrl.slice(0, queryIndex);
+  const query = new URLSearchParams(queryIndex < 0 ? '' : rawUrl.slice(queryIndex + 1));
   const method = req.method ?? 'GET';
 
   // The env's boot probe: no auth, always the same answer.
@@ -96,7 +102,7 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
 
   if (gitMatch !== null) {
     const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
-    return handleGit(forge, decodeSegment(gitMatch[1] as string), decodeSegment(gitMatch[2] as string), gitMatch[3] as string, req, body, url.searchParams);
+    return handleGit(forge, decodeSegment(gitMatch[1] as string), decodeSegment(gitMatch[2] as string), gitMatch[3] as string, req, body, query);
   }
 
   if (path === '/api/graphql') {
@@ -112,8 +118,9 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
     return handleMcp(forge, body.toString('utf8'));
   }
 
-  // REST v3.
-  const body = await readBody(req);
+  // REST v3. A GET never carries a body in this API: answer without waiting for the
+  // request stream to end, which saves an event-loop turn on every read.
+  const body = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
   const segments = path
     .slice('/api/v3/'.length)
     .split('/')
@@ -124,7 +131,7 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
     forge,
     method,
     segments,
-    query: url.searchParams,
+    query,
     bodyText: body.toString('utf8'),
     origin: `http://${host}`,
     pathname: path,
