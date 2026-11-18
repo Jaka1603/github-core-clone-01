@@ -66,6 +66,9 @@ function decodeSegment(segment: string): string {
 
 const GIT_PATH = /^\/([^/]+)\/(.+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
+/** Shared empty query for the many requests that carry none (readers only ever read it). */
+const EMPTY_QUERY = new URLSearchParams();
+
 async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
   // Split the raw target by hand: a full WHATWG URL parse per request costs more than
   // the routing that follows it, and the path stays percent-encoded here exactly as the
@@ -73,7 +76,7 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
   const rawUrl = req.url ?? '/';
   const queryIndex = rawUrl.indexOf('?');
   const path = queryIndex < 0 ? rawUrl : rawUrl.slice(0, queryIndex);
-  const query = new URLSearchParams(queryIndex < 0 ? '' : rawUrl.slice(queryIndex + 1));
+  const query = queryIndex < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(queryIndex + 1));
   const method = req.method ?? 'GET';
 
   // The env's boot probe: no auth, always the same answer.
@@ -92,7 +95,9 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
     );
   }
 
-  const gitMatch = GIT_PATH.exec(path);
+  // The git regex only ever matches a path holding ".git/"; the native scan keeps it
+  // off every REST, GraphQL and MCP request.
+  const gitMatch = path.includes('.git/') ? GIT_PATH.exec(path) : null;
   const isApi = path.startsWith('/api/v3/') || path === '/api/graphql' || path === '/mcp' || gitMatch !== null;
   if (!isApi) return notFound();
 
@@ -121,11 +126,17 @@ async function route(forge: Forge, req: IncomingMessage): Promise<HttpResult> {
   // REST v3. A GET never carries a body in this API: answer without waiting for the
   // request stream to end, which saves an event-loop turn on every read.
   const body = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
-  const segments = path
-    .slice('/api/v3/'.length)
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map(decodeSegment);
+  // One pass over the path tail: split on '/', drop the empty pieces, decode each
+  // segment in place (the old split/filter/map built three arrays to do the same).
+  const tail = path.slice('/api/v3/'.length);
+  const segments: string[] = [];
+  let segmentStart = 0;
+  for (let index = 0; index <= tail.length; index += 1) {
+    if (index === tail.length || tail[index] === '/') {
+      if (index > segmentStart) segments.push(decodeSegment(tail.slice(segmentStart, index)));
+      segmentStart = index + 1;
+    }
+  }
   const host = req.headers.host ?? 'localhost';
   return handleRest({
     forge,
@@ -146,8 +157,12 @@ export function createApp(): Server {
     const requestId = `req-${requestCounter}`;
     route(forge, req)
       .then((result) => {
-        const headers = { ...(result.headers ?? {}), 'x-github-request-id': requestId };
-        sendResult(res, { ...result, headers });
+        // Stamp the request id onto the result's own header bag (every result is
+        // built fresh for its request) instead of spreading two objects per reply.
+        const headers = result.headers ?? {};
+        headers['x-github-request-id'] = requestId;
+        result.headers = headers;
+        sendResult(res, result);
       })
       .catch(() => {
         // A handler failure is a JSON 500, never a dead server.

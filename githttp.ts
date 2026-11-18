@@ -59,17 +59,19 @@ function v0RefLines(forge: Forge, repo: RepoRec, caps: string): Buffer[] {
   return lines;
 }
 
+/** The protocol-v2 advertisement: the same bytes for every repository and request, built once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function infoRefs(forge: Forge, repo: RepoRec, service: string, protocolHeader: string | undefined): HttpResult {
   if (service === 'git-upload-pack' && protocolHeader !== undefined && protocolHeader.includes('version=2')) {
-    const body = Buffer.concat([
-      pktLine('version 2\n'),
-      pktLine(`agent=${AGENT}\n`),
-      pktLine('ls-refs=unborn\n'),
-      pktLine('fetch=shallow\n'),
-      pktLine('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
   }
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS : RECEIVE_CAPS;
   const body = Buffer.concat([pktLine(`# service=${service}\n`), PKT_FLUSH, ...v0RefLines(forge, repo, caps), PKT_FLUSH]);
@@ -239,9 +241,13 @@ function buildFetchV0(forge: Forge, repo: RepoRec, args: FetchArgs): { result: H
   };
 }
 
-/** The cache key of a fetch answer: the framing plus the fetch's inputs, in order. */
+/**
+ * The cache key of a fetch answer: the framing plus the fetch's inputs, in order.
+ * Object ids are hex and carry no separator, so a plain join names the same tuple
+ * JSON.stringify did, without building the intermediate arrays and string escapes.
+ */
 function fetchCacheKey(args: FetchArgs, framing: string): string {
-  return `${framing}|${JSON.stringify([args.wants, args.haves, args.shallow, args.depth])}`;
+  return `${framing}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth}`;
 }
 
 /**
@@ -435,10 +441,19 @@ export function handleGit(
 
 /** Write an HttpResult to the response. */
 export function sendResult(res: ServerResponse, result: HttpResult): void {
-  res.writeHead(result.status, {
-    'content-type': result.contentType,
-    'content-length': result.body.length,
-    ...(result.headers ?? {}),
-  });
+  const extra = result.headers;
+  if (extra === undefined || Object.keys(extra).length === 0) {
+    res.writeHead(result.status, {
+      'content-type': result.contentType,
+      'content-length': result.body.length,
+    });
+  } else {
+    const headers: Record<string, string | number> = {
+      'content-type': result.contentType,
+      'content-length': result.body.length,
+    };
+    for (const name of Object.keys(extra)) headers[name] = extra[name] as string;
+    res.writeHead(result.status, headers);
+  }
   res.end(result.body);
 }

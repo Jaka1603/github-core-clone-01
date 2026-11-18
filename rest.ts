@@ -87,7 +87,7 @@ function paginate<T>(req: RestRequest, items: readonly T[]): { page: T[]; header
 
 /** The opaque global id of a repository (shared with GraphQL; never the plain database id). */
 export function repoNodeId(repo: RepoRec): string {
-  return Buffer.from(`R${repo.dbId}`, 'utf8').toString('base64url');
+  return repo.nodeId;
 }
 
 export function repoJson(forge: Forge, repo: RepoRec): Record<string, unknown> {
@@ -117,7 +117,7 @@ export function issueJson(forge: Forge, repo: RepoRec, issue: IssueRec): Record<
   const createdAt = forge.isoOf(issue.createdTick);
   return {
     id: issue.id,
-    node_id: Buffer.from(`I${repo.dbId}.${issue.number}`, 'utf8').toString('base64url'),
+    node_id: issue.nodeId,
     number: issue.number,
     title: issue.title,
     body: issue.body,
@@ -151,7 +151,7 @@ export function pullJson(forge: Forge, repo: RepoRec, pull: PullRec): Record<str
   const login = forge.login();
   return {
     id: pull.id,
-    node_id: Buffer.from(`P${repo.dbId}.${pull.number}`, 'utf8').toString('base64url'),
+    node_id: pull.nodeId,
     number: pull.number,
     state: pull.state,
     title: pull.title,

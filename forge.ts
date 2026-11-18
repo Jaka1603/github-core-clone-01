@@ -36,6 +36,8 @@ export interface CommentRec {
 export interface IssueRec {
   /** Global numeric id (the REST `id` field); stable for the issue's life. */
   id: number;
+  /** The opaque global id (base64url of "I<repoDbId>.<number>"), fixed at creation. */
+  nodeId: string;
   number: number;
   title: string;
   body: string;
@@ -47,6 +49,8 @@ export interface IssueRec {
 
 export interface PullRec {
   id: number;
+  /** The opaque global id (base64url of "P<repoDbId>.<number>"), fixed at creation. */
+  nodeId: string;
   number: number;
   title: string;
   body: string;
@@ -65,6 +69,8 @@ export interface PullRec {
 export interface RepoRec {
   /** The numeric database id GraphQL reports; unique across the forge. */
   dbId: number;
+  /** The opaque global id (base64url of "R<dbId>"), fixed at creation. */
+  nodeId: string;
   name: string;
   private: boolean;
   description: string;
@@ -106,6 +112,8 @@ export class Forge {
   private nextPullId = 1;
   private nextCommentId = 1;
   private tick = 0;
+  /** ISO-8601 strings by tick: a tick's string never changes, so each is built once. */
+  private readonly isoCache = new Map<number, string>();
 
   /**
    * The token owner's login. The trial's bearer token carries no name, so the forge learns
@@ -121,9 +129,13 @@ export class Forge {
     return this.tick;
   }
 
-  /** ISO-8601 for a tick, on the logical clock. */
+  /** ISO-8601 for a tick, on the logical clock (memoized: the answer never changes). */
   isoOf(tickValue: number): string {
-    return new Date((EPOCH_SEC + tickValue) * 1000).toISOString();
+    const cached = this.isoCache.get(tickValue);
+    if (cached !== undefined) return cached;
+    const iso = new Date((EPOCH_SEC + tickValue) * 1000).toISOString();
+    this.isoCache.set(tickValue, iso);
+    return iso;
   }
 
   /** The current logical time as ISO-8601 (does not advance the clock). */
@@ -184,6 +196,7 @@ export class Forge {
     if (this.repos.has(name)) return null;
     const repo: RepoRec = {
       dbId: this.nextDbId,
+      nodeId: Buffer.from(`R${this.nextDbId}`, 'utf8').toString('base64url'),
       name,
       private: options.private ?? false,
       description: options.description ?? '',
@@ -529,6 +542,7 @@ export class Forge {
   createIssue(repo: RepoRec, title: string, body: string, labels: string[]): IssueRec {
     const issue: IssueRec = {
       id: this.nextIssueId,
+      nodeId: Buffer.from(`I${repo.dbId}.${repo.nextNumber}`, 'utf8').toString('base64url'),
       number: repo.nextNumber,
       title,
       body,
@@ -560,6 +574,7 @@ export class Forge {
     if (headSha === null || baseSha === null) return null;
     const pull: PullRec = {
       id: this.nextPullId,
+      nodeId: Buffer.from(`P${repo.dbId}.${repo.nextNumber}`, 'utf8').toString('base64url'),
       number: repo.nextNumber,
       title,
       body,
